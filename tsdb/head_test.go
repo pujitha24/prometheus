@@ -7899,6 +7899,280 @@ func TestHead_NumStaleSeries(t *testing.T) {
 	verifySeriesCounts(4, 5)
 }
 
+// TestHead_NumStaleSeries_MixedTypeTransitions verifies that the stale-series
+// gauge is maintained when a series' most recent sample changes between float,
+// integer histogram, and float histogram, both during live ingestion and after
+// a WAL replay. Before the fix, a series that went stale as one sample type and
+// then received a non-stale sample of a different type stayed counted as stale,
+// because staleness was derived from a type-specific last value.
+func TestHead_NumStaleSeries_MixedTypeTransitions(t *testing.T) {
+	head, _ := newTestHead(t, 1000, compression.None, false)
+	t.Cleanup(func() {
+		// Captures head by reference, so it closes the final head after restarts.
+		_ = head.Close()
+	})
+	require.NoError(t, head.Init(0))
+
+	appendSample := func(lbls labels.Labels, ts int64, val float64) {
+		app := head.Appender(context.Background())
+		_, err := app.Append(0, lbls, ts, val)
+		require.NoError(t, err)
+		require.NoError(t, app.Commit())
+	}
+	appendHistogram := func(lbls labels.Labels, ts int64, val *histogram.Histogram) {
+		app := head.Appender(context.Background())
+		_, err := app.AppendHistogram(0, lbls, ts, val, nil)
+		require.NoError(t, err)
+		require.NoError(t, app.Commit())
+	}
+	appendFloatHistogram := func(lbls labels.Labels, ts int64, val *histogram.FloatHistogram) {
+		app := head.Appender(context.Background())
+		_, err := app.AppendHistogram(0, lbls, ts, nil, val)
+		require.NoError(t, err)
+		require.NoError(t, app.Commit())
+	}
+	restartHead := func() {
+		require.NoError(t, head.Close())
+		wal, err := wlog.NewSize(nil, nil, filepath.Join(head.opts.ChunkDirRoot, "wal"), 32768, compression.None)
+		require.NoError(t, err)
+		head, err = NewHead(nil, nil, wal, nil, head.opts, nil)
+		require.NoError(t, err)
+		require.NoError(t, head.Init(0))
+	}
+
+	stale := math.Float64frombits(value.StaleNaN)
+	hist := tsdbutil.GenerateTestHistogram(1)
+	staleHist := hist.Copy()
+	staleHist.Sum = stale
+	floatHist := tsdbutil.GenerateTestFloatHistogram(1)
+	staleFloatHist := floatHist.Copy()
+	staleFloatHist.Sum = stale
+
+	// Each series goes stale as one type and then receives a non-stale sample of
+	// a different type; the series must no longer be counted as stale.
+	floatToHist := labels.FromStrings("name", "float_to_histogram")
+	appendSample(floatToHist, 100, stale)
+	require.Equal(t, uint64(1), head.NumStaleSeries())
+	appendHistogram(floatToHist, 200, hist)
+	require.Equal(t, uint64(0), head.NumStaleSeries())
+
+	histToFloat := labels.FromStrings("name", "histogram_to_float")
+	appendHistogram(histToFloat, 100, staleHist)
+	require.Equal(t, uint64(1), head.NumStaleSeries())
+	appendSample(histToFloat, 200, 5)
+	require.Equal(t, uint64(0), head.NumStaleSeries())
+
+	floatHistToHist := labels.FromStrings("name", "float_histogram_to_histogram")
+	appendFloatHistogram(floatHistToHist, 100, staleFloatHist)
+	require.Equal(t, uint64(1), head.NumStaleSeries())
+	appendHistogram(floatHistToHist, 200, hist)
+	require.Equal(t, uint64(0), head.NumStaleSeries())
+
+	// This series is left stale (integer histogram marker) to exercise the replay
+	// path for a series whose final sample is a staleness marker.
+	histThenFloatHist := labels.FromStrings("name", "histogram_then_float_histogram")
+	appendHistogram(histThenFloatHist, 100, staleHist)
+	require.Equal(t, uint64(1), head.NumStaleSeries())
+
+	// The same accounting must hold after replaying the WAL.
+	restartHead()
+	require.Equal(t, uint64(1), head.NumStaleSeries())
+	require.Equal(t, uint64(4), head.NumSeries())
+
+	// After replay, resolve the remaining stale series to non-stale via a
+	// different sample type, which must decrement the gauge post-replay as well.
+	appendFloatHistogram(histThenFloatHist, 200, floatHist)
+	require.Equal(t, uint64(0), head.NumStaleSeries())
+}
+
+// TestHead_NumStaleSeries_MixedTypeReload verifies that the stale-series gauge is
+// reconstructed correctly across a restart via both WAL replay and a memory
+// snapshot, for series that changed sample type before the restart. Assertions
+// are made only after the restart so the reconstruction path is exercised on its
+// own.
+func TestHead_NumStaleSeries_MixedTypeReload(t *testing.T) {
+	for _, snapshot := range []bool{false, true} {
+		name := "wal"
+		if snapshot {
+			name = "snapshot"
+		}
+		t.Run(name, func(t *testing.T) {
+			head, _ := newTestHead(t, 1000, compression.None, false)
+			head.opts.EnableMemorySnapshotOnShutdown = snapshot
+			t.Cleanup(func() {
+				// Captures head by reference, so it closes the final head after restart.
+				_ = head.Close()
+			})
+			require.NoError(t, head.Init(0))
+
+			appendSample := func(lbls labels.Labels, ts int64, val float64) {
+				app := head.Appender(context.Background())
+				_, err := app.Append(0, lbls, ts, val)
+				require.NoError(t, err)
+				require.NoError(t, app.Commit())
+			}
+			appendHistogram := func(lbls labels.Labels, ts int64, val *histogram.Histogram) {
+				app := head.Appender(context.Background())
+				_, err := app.AppendHistogram(0, lbls, ts, val, nil)
+				require.NoError(t, err)
+				require.NoError(t, app.Commit())
+			}
+			appendFloatHistogram := func(lbls labels.Labels, ts int64, val *histogram.FloatHistogram) {
+				app := head.Appender(context.Background())
+				_, err := app.AppendHistogram(0, lbls, ts, nil, val)
+				require.NoError(t, err)
+				require.NoError(t, app.Commit())
+			}
+
+			stale := math.Float64frombits(value.StaleNaN)
+			hist := tsdbutil.GenerateTestHistogram(1)
+			staleHist := hist.Copy()
+			staleHist.Sum = stale
+			floatHist := tsdbutil.GenerateTestFloatHistogram(1)
+
+			// Series that go stale as one type and become non-stale as another.
+			floatToHist := labels.FromStrings("name", "float_to_histogram")
+			appendSample(floatToHist, 100, stale)
+			appendHistogram(floatToHist, 200, hist)
+
+			floatToFloatHist := labels.FromStrings("name", "float_to_float_histogram")
+			appendSample(floatToFloatHist, 100, stale)
+			appendFloatHistogram(floatToFloatHist, 200, floatHist)
+
+			histToFloat := labels.FromStrings("name", "histogram_to_float")
+			appendHistogram(histToFloat, 100, staleHist)
+			appendSample(histToFloat, 200, 5)
+
+			// One series left stale.
+			staleOnly := labels.FromStrings("name", "stale_only")
+			appendHistogram(staleOnly, 100, staleHist)
+
+			// Restart, forcing the gauge to be rebuilt from the WAL and/or snapshot.
+			require.NoError(t, head.Close())
+			wal, err := wlog.NewSize(nil, nil, filepath.Join(head.opts.ChunkDirRoot, "wal"), 32768, compression.None)
+			require.NoError(t, err)
+			head, err = NewHead(nil, nil, wal, nil, head.opts, nil)
+			require.NoError(t, err)
+			require.NoError(t, head.Init(0))
+
+			require.Equal(t, uint64(4), head.NumSeries())
+			require.Equal(t, uint64(1), head.NumStaleSeries())
+		})
+	}
+}
+
+// TestHead_NumStaleSeries_CrossTypeGC verifies that garbage-collecting a series
+// that resolved to non-stale via a different sample type does not decrement the
+// stale-series gauge. Such a series keeps a lingering stale lastValue from its
+// earlier float sample, so a removal path that inspected lastValue directly
+// would wrongly decrement (and underflow) the gauge to stay consistent with the
+// commit-path accounting.
+func TestHead_NumStaleSeries_CrossTypeGC(t *testing.T) {
+	head, _ := newTestHead(t, 1000, compression.None, false)
+	t.Cleanup(func() { _ = head.Close() })
+	require.NoError(t, head.Init(0))
+
+	appendSample := func(lbls labels.Labels, ts int64, val float64) {
+		app := head.Appender(context.Background())
+		_, err := app.Append(0, lbls, ts, val)
+		require.NoError(t, err)
+		require.NoError(t, app.Commit())
+	}
+	appendHistogram := func(lbls labels.Labels, ts int64, val *histogram.Histogram) {
+		app := head.Appender(context.Background())
+		_, err := app.AppendHistogram(0, lbls, ts, val, nil)
+		require.NoError(t, err)
+		require.NoError(t, app.Commit())
+	}
+
+	stale := math.Float64frombits(value.StaleNaN)
+	hist := tsdbutil.GenerateTestHistogram(1)
+
+	// A series that goes stale as a float and becomes non-stale as a histogram.
+	crossType := labels.FromStrings("name", "cross_type")
+	appendSample(crossType, 100, stale)
+	appendHistogram(crossType, 200, hist)
+	// A separate series to keep the head alive past the truncation point.
+	keeper := labels.FromStrings("name", "keeper")
+	appendSample(keeper, 5000, 1)
+	require.Equal(t, uint64(0), head.NumStaleSeries())
+
+	// Truncate past crossType's samples and garbage-collect it.
+	require.NoError(t, head.Truncate(1000))
+	head.gc()
+
+	require.Equal(t, uint64(1), head.NumSeries())
+	require.Equal(t, uint64(0), head.NumStaleSeries())
+}
+
+// TestHead_NumStaleSeries_WALReplayIgnoresRejectedCrossTypeSamples verifies
+// that an older sample appearing later in the WAL does not change stale-series
+// accounting when replay rejects it. This ordering is possible when concurrent
+// appenders log in one order but apply their samples to the series in another.
+func TestHead_NumStaleSeries_WALReplayIgnoresRejectedCrossTypeSamples(t *testing.T) {
+	stale := math.Float64frombits(value.StaleNaN)
+	hist := tsdbutil.GenerateTestHistogram(1)
+	staleHist := hist.Copy()
+	staleHist.Sum = stale
+	floatHist := tsdbutil.GenerateTestFloatHistogram(1)
+
+	tests := []struct {
+		name  string
+		newer any
+		older any
+	}{
+		{
+			name: "histogram_then_older_float",
+			newer: []record.RefHistogramSample{
+				{Ref: 1, T: 200, H: staleHist},
+			},
+			older: []record.RefSample{
+				{Ref: 1, T: 100, V: 1},
+			},
+		},
+		{
+			name: "float_then_older_histogram",
+			newer: []record.RefSample{
+				{Ref: 1, T: 200, V: stale},
+			},
+			older: []record.RefHistogramSample{
+				{Ref: 1, T: 100, H: hist},
+			},
+		},
+		{
+			name: "float_then_older_float_histogram",
+			newer: []record.RefSample{
+				{Ref: 1, T: 200, V: stale},
+			},
+			older: []record.RefFloatHistogramSample{
+				{Ref: 1, T: 100, FH: floatHist},
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			head, wal := newTestHead(t, 1000, compression.None, false)
+			t.Cleanup(func() { require.NoError(t, head.Close()) })
+
+			populateTestWL(t, wal, []any{
+				[]record.RefSeries{{Ref: 1, Labels: labels.FromStrings("name", tc.name)}},
+				[]record.RefSample{{Ref: 1, T: 0, V: 1}},
+				tc.newer,
+				tc.older,
+			}, nil, false)
+
+			require.NoError(t, head.Init(0))
+
+			series := head.series.getByID(1)
+			require.NotNil(t, series)
+			require.Equal(t, int64(200), series.maxTime())
+			require.True(t, isStaleSeries(series))
+			require.Equal(t, uint64(1), head.NumSeries())
+			require.Equal(t, uint64(1), head.NumStaleSeries())
+		})
+	}
+}
+
 // TestHead_FilterSelectedSeriesAndSortPostings exercises the helper directly, covering the
 // three outcomes for a given ref: kept (clean series), skipped (series carries OOO data), and
 // silently dropped (ref does not resolve to any series in the head).
@@ -9509,7 +9783,7 @@ func TestHead_mmapHeadChunks(t *testing.T) {
 
 		type testCase struct {
 			appendOnce     func(app storage.Appender, lbls labels.Labels, ts int64, i int) error
-			appendInternal func(ms *memSeries, t int64, opts chunkOpts) bool
+			appendInternal func(ms *memSeries, t int64, opts chunkOpts) (bool, bool)
 		}
 		testCases := map[string]testCase{
 			"floats": {
@@ -9517,9 +9791,8 @@ func TestHead_mmapHeadChunks(t *testing.T) {
 					_, err := app.Append(0, lbls, ts, float64(ts))
 					return err
 				},
-				appendInternal: func(ms *memSeries, t int64, opts chunkOpts) bool {
-					_, chunkCreated := ms.append(0, t, 0, 0, opts)
-					return chunkCreated
+				appendInternal: func(ms *memSeries, t int64, opts chunkOpts) (bool, bool) {
+					return ms.append(0, t, 0, 0, opts)
 				},
 			},
 			"histograms": {
@@ -9527,9 +9800,8 @@ func TestHead_mmapHeadChunks(t *testing.T) {
 					_, err := app.AppendHistogram(0, lbls, ts, histograms[i], nil)
 					return err
 				},
-				appendInternal: func(ms *memSeries, t int64, opts chunkOpts) bool {
-					_, chunkCreated := ms.appendHistogram(0, t, histograms[0], 0, opts)
-					return chunkCreated
+				appendInternal: func(ms *memSeries, t int64, opts chunkOpts) (bool, bool) {
+					return ms.appendHistogram(0, t, histograms[0], 0, opts)
 				},
 			},
 			"float histograms": {
@@ -9537,9 +9809,8 @@ func TestHead_mmapHeadChunks(t *testing.T) {
 					_, err := app.AppendHistogram(0, lbls, ts, nil, floatHistograms[i])
 					return err
 				},
-				appendInternal: func(ms *memSeries, t int64, opts chunkOpts) bool {
-					_, chunkCreated := ms.appendFloatHistogram(0, t, floatHistograms[0], 0, opts)
-					return chunkCreated
+				appendInternal: func(ms *memSeries, t int64, opts chunkOpts) (bool, bool) {
+					return ms.appendFloatHistogram(0, t, floatHistograms[0], 0, opts)
 				},
 			},
 		}
@@ -9575,7 +9846,7 @@ func TestHead_mmapHeadChunks(t *testing.T) {
 				// Invoke the WAL-replay-style helper with a sample timestamped
 				// past the next chunk boundary to force a chunk cut.
 				s.Lock()
-				chunkCreated := h.appendChunkAndMmap(s, func() bool {
+				_, chunkCreated := h.appendChunkAndMmap(s, func() (bool, bool) {
 					return tc.appendInternal(s, ts+h.chunkRange.Load(), chunkOpts{
 						chunkDiskMapper: h.chunkDiskMapper,
 						chunkRange:      h.chunkRange.Load(),
