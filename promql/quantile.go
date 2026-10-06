@@ -531,6 +531,9 @@ func HistogramFraction(lower, upper float64, h *histogram.FloatHistogram, metric
 
 // BucketFraction is a version of HistogramFraction for classic histograms.
 func BucketFraction(lower, upper float64, buckets Buckets) float64 {
+	if len(buckets) == 0 {
+		return math.NaN()
+	}
 	slices.SortFunc(buckets, func(a, b Bucket) int {
 		// We don't expect the bucket boundary to be a NaN.
 		if a.UpperBound < b.UpperBound {

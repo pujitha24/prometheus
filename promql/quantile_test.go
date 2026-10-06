@@ -562,3 +562,12 @@ func TestTrimBuckets_HistogramFractionCrossCheck(t *testing.T) {
 		})
 	}
 }
+
+func TestBucketFraction_EmptyBuckets(t *testing.T) {
+	for name, buckets := range map[string]Buckets{"nil": nil, "empty": {}} {
+		t.Run(name, func(t *testing.T) {
+			require.True(t, math.IsNaN(BucketFraction(0, 1, buckets)))
+			require.True(t, math.IsNaN(BucketFraction(math.Inf(-1), math.Inf(1), buckets)))
+		})
+	}
+}
